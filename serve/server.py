@@ -155,6 +155,11 @@ class GpuBusy(RuntimeError):
     model server) is using it, so the engine is not started into the little that is left."""
 
 
+class ModelSwitchFailed(RuntimeError):
+    """A model switch could not build or start the new model; the old one was started again (or left for the next
+    request to restart)."""
+
+
 ENGINE_REQUEST = re.compile(
     # "+ 12288 of 98179 read": a request cancelled while its prompt was read (#471)
     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
@@ -1286,6 +1291,8 @@ class Vision:
         contain(self.proc)
         line = self.proc.stdout.readline()
         if not line.startswith("READY"):
+            self.proc.kill()
+            self.proc.wait(timeout=10)
             raise RuntimeError("the vision encoder did not start: " + line.strip())
         self.stopped = False
 
@@ -1657,6 +1664,14 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
+        # model switching: every model this server can switch to (name -> its config entry, the resident one
+        # included - switching back to it and the rollback both need it), and the entry the resident model was
+        # built from (POST /v1/models/switch)
+        self.model_specs: dict[str, dict] = {}
+        self.current_spec = None
+        self._failed_start_engine = None               # retain ownership if a failed replacement cannot exit
+        self._switching = False
+        self._model_requests = 0                       # includes prompt preparation and multi-turn MCP requests
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -1715,17 +1730,7 @@ class Service:
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
         ValueError for anything else."""
-        if aliases is None:
-            aliases = []
-        if isinstance(aliases, str):
-            aliases = aliases.split(",")
-        if not isinstance(aliases, list) or not all(isinstance(x, str) for x in aliases):
-            raise ValueError(f"aliases={aliases!r}: expected a list of model names")
-        names = []
-        for x in (x.strip() for x in aliases):
-            if x and x != self.model and x not in names:
-                names.append(x)
-        self.aliases = names
+        self.aliases = model_aliases(aliases, self.model)
 
     def model_names(self) -> list[str]:
         return [self.model, *self.aliases]
@@ -1735,6 +1740,133 @@ class Service:
         Other names are still served, as before."""
         asked = req.get("model") if isinstance(req, dict) else None
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
+
+    def _start_model(self, spec: dict) -> dict:
+        """Build a replacement privately, including READY, before publishing anything on the service."""
+        settings = model_settings(spec)
+        tpath = Path(spec["tokenizer"])
+        tok = load_tokenizer(tpath)
+        native = spec.get("_engine", "strata") == "strata"
+        if tok is None:
+            if native:
+                raise ValueError(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
+            tok = ByteTokenizer()
+        template = chat_template_for(tpath)
+        stop_ids = set(tok.encode(IM_END, parse_special=True) + tok.encode("<|endoftext|>", parse_special=True))
+        engine, vision = None, None
+        try:
+            if native:
+                checked = engine_start_checks(spec, tok)
+                env = child_env(spec)
+                vision = build_vision(spec, env) if spec.get("vision") else None
+                engine, effort_end = build_engine(spec, env, lazy=True, checked=checked)
+                engine.restart()
+            else:
+                engine = MockEngine(tok, spec.get("script") or ["Thinking about it.</think>\n\nHello from the mock engine."])
+                effort_end = False
+            if hasattr(engine, "alive") and not engine.alive():
+                raise EngineDied("the engine stopped before the model could be installed")
+            if self.vram_reserve is not None and hasattr(engine, "vram"):
+                try:
+                    engine.vram(self.vram_reserve)
+                except (ValueError, EngineDied) as e:
+                    print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+            if hasattr(engine, "alive") and not engine.alive():
+                raise EngineDied("the engine stopped while applying the VRAM reserve")
+            return dict(settings, engine=engine, vision=vision, tok=tok, template=template,
+                        stop_ids=stop_ids, effort_end=bool(effort_end))
+        except Exception:
+            # A failed start can leave a process behind. End it before rollback uses the same GPU/RAM.
+            try:
+                if engine is not None and hasattr(engine, "close"):
+                    try:
+                        engine.close()
+                    except EngineStuck:
+                        self._failed_start_engine = engine
+                        raise
+            finally:
+                if vision is not None:
+                    vision.close()
+            raise
+
+    @contextlib.contextmanager
+    def model_request(self):
+        """Keep one model for an HTTP request, from prompt preparation through the last streamed token.
+
+        Requests arriving during a switch wait for its fifo; already admitted requests refuse a switch, including
+        the interval before run() marks them queued and gaps between MCP turns.
+        """
+        while True:
+            with self.status_lock:
+                if not self._switching:
+                    self._model_requests += 1
+                    break
+            with self.fifo:
+                pass
+        try:
+            yield
+        finally:
+            with self.status_lock:
+                self._model_requests -= 1
+
+    def switch_model(self, name: str) -> dict:
+        """Explicit, synchronous replacement of the resident model, with rollback on a failed start."""
+        if name != self.model and name not in self.model_specs:
+            raise KeyError(name)
+        if name == self.model:
+            return {"status": "already", "model": name}
+        if not self.fifo.acquire(blocking=False):
+            raise ModelBusy("a request is running or queued")
+        try:
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued") or self._model_requests:
+                    raise ModelBusy("a request is running or queued")
+                self._switching = True
+            # Another control may have completed just before we took the lock.
+            if name == self.model:
+                return {"status": "already", "model": name}
+            old_spec = self.current_spec or self.model_specs[self.model]
+            old_gpus = (getattr(self, "gpu_index", 0), getattr(self, "gpu_indices", []),
+                        getattr(self, "backend", None))
+            self._close_failed_start()
+            if hasattr(self.engine, "close"):
+                self.engine.close()                  # EngineStuck: retain ownership, never spawn a replacement
+            try:
+                if self.vision is not None:
+                    self.vision.close()
+                self._wait_free_vram(self.model_specs[name])  # after unload, on the replacement's first GPU
+                replacement = self._start_model(self.model_specs[name])
+            except Exception as error:
+                note = f"could not switch to model {name}: {error}"
+                try:
+                    if self._failed_start_engine is not None:
+                        raise EngineStuck("the replacement is still releasing GPU/RAM; rollback must wait for it")
+                    restored = self._start_model(old_spec)  # GpuBusy also restores the old model, without the guard
+                    self.engine, self.vision = restored["engine"], restored["vision"]
+                    self.conv_log.reset()
+                    note += f"; restored model {self.model}"
+                except Exception as rollback_error:
+                    # Keep the old spawn config on self.engine so the next request can retry ensure_loaded().
+                    note += f"; restoring model {self.model} also failed: {rollback_error}; the next request retries it"
+                raise ModelSwitchFailed(note) from error
+            with self.status_lock:
+                for key, value in replacement.items():
+                    setattr(self, key, value)
+                self.model, self.current_spec = name, self.model_specs[name]
+                self.rate.clear()
+                self.live_reqs.clear()
+                self.last_timings = None
+                self.status = {"busy": False, "queued": self.status.get("queued", 0)}
+                self.last_request_at = time.time()
+                self.conv_log.reset()
+            if old_gpus != (self.gpu_index, self.gpu_indices, self.backend) and getattr(self, "telemetry", None):
+                self.telemetry.set_gpus(self.gpu_index, self.gpu_indices, amd=self.backend == "hip")
+            print(f"[strata] switched to model {name}", flush=True)
+            return {"status": "switched", **self.v1_status()}
+        finally:
+            with self.status_lock:
+                self._switching = False
+            self.fifo.release()
 
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
@@ -1770,9 +1902,39 @@ class Service:
         except Exception:
             return None
 
+    def _wait_free_vram(self, spec: dict | None = None):
+        """The min_free_vram_mib check: wait briefly for memory another process just gave back, then raise
+        GpuBusy when the GPU still has less free than the model needs.  The caller holds self.fifo."""
+        if not self.min_free_vram_mib:
+            return
+
+        def free_mib():
+            if spec is None:
+                return self.free_vram_mib()
+            try:
+                from serve.telemetry import free_vram_mib
+                return free_vram_mib((gpu_list(spec) or [0])[0], amd=spec.get("backend") == "hip")
+            except Exception:
+                return None
+
+        free = free_mib()
+        deadline = time.time() + 15                 # memory another process just gave back can take a moment
+        while free is not None and free < self.min_free_vram_mib and time.time() < deadline:
+            time.sleep(0.5)
+            free = free_mib()
+        if free is not None and free < self.min_free_vram_mib:
+            raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
+                          f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
+
+    def _close_failed_start(self):
+        if self._failed_start_engine is not None:
+            self._failed_start_engine.close()
+            self._failed_start_engine = None
+
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
+        self._close_failed_start()
         if self.loaded() and not self._vision_down():
             return
         if self.before_load:
@@ -1782,15 +1944,7 @@ class Service:
                 subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError) as e:
                 print(f"[strata] the before_load command failed ({e}); loading anyway", flush=True)
-        if self.min_free_vram_mib:
-            free = self.free_vram_mib()
-            deadline = time.time() + 15                 # memory another process just gave back can take a moment
-            while free is not None and free < self.min_free_vram_mib and time.time() < deadline:
-                time.sleep(0.5)
-                free = self.free_vram_mib()
-            if free is not None and free < self.min_free_vram_mib:
-                raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
-                              f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
+        self._wait_free_vram()
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder again ...", flush=True)   # the engine sizes its cache
             self.vision.restart()
@@ -2090,6 +2244,7 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "switchable_models": list(self.model_specs),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -3052,13 +3207,17 @@ def make_handler(svc: Service):
                              "meta": {"n_ctx": svc.engine.max_context},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
-                    if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
+                    if not loaded and (svc.model_specs or svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
                         loaded = True
                     if svc.aliases:                       # #297: the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    self._json(200, {"object": "list", "data": data if loaded else []})
+                    data = data if loaded else []
+                    if svc.model_specs:
+                        data.extend({"id": name, "object": "model", "status": {"value": "switchable"},
+                                     "switchable": True} for name in svc.model_specs if name != svc.model)
+                    self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -3087,10 +3246,12 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
-            if path in ("/unload", "/load") and not self._control_body():
+            if path in ("/unload", "/load", "/switch") and not self._control_body():
                 return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
             if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
+                return
+            if path in ("/switch", "/v1/models/switch") and not self._own_page("the model can be switched"):
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
@@ -3108,12 +3269,26 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
-                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                body = self.control_body if path == "/switch" else \
+                    self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                req = json.loads(body or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
+                    return
+                if path in ("/v1/models/switch", "/switch"):
+                    name = req.get("model")
+                    if not isinstance(name, str):
+                        raise ValueError("model: send a model name as a string")
+                    try:
+                        result = svc.switch_model(name)
+                    except KeyError:
+                        self._json(404, {"error": {"message": "model not found",
+                                                  "known": list(dict.fromkeys([svc.model, *svc.model_specs]))}})
+                        return
+                    self._json(200, result)
                     return
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
@@ -3150,18 +3325,21 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
-                    self.record = svc.begin_request(path, req)
-                if path == "/v1/responses":
-                    self._responses(req)
-                elif path == "/v1/chat/completions":
-                    self._openai(req)
-                elif path == "/v1/messages":
-                    self._anthropic(req)
-                elif path == "/v1/messages/count_tokens":
-                    self._count_tokens(req)
-                else:
-                    self._json(404, {"error": {"message": "not found"}})
+                inference = path in ("/v1/chat/completions", "/v1/messages", "/v1/responses",
+                                     "/v1/messages/count_tokens")
+                with (svc.model_request() if inference else contextlib.nullcontext()):
+                    if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                        self.record = svc.begin_request(path, req)
+                    if path == "/v1/responses":
+                        self._responses(req)
+                    elif path == "/v1/chat/completions":
+                        self._openai(req)
+                    elif path == "/v1/messages":
+                        self._anthropic(req)
+                    elif path == "/v1/messages/count_tokens":
+                        self._count_tokens(req)
+                    else:
+                        self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
@@ -3172,7 +3350,7 @@ def make_handler(svc: Service):
             except StructuredOutputError as e:
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                           "message": str(e)}})
-            except (GpuBusy, EngineStarting) as e:
+            except (GpuBusy, EngineStarting, ModelSwitchFailed) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
@@ -3231,7 +3409,8 @@ def make_handler(svc: Service):
             timeout = self.connection.gettimeout()
             try:
                 self.connection.settimeout(2.0)
-                complete = len(self.rfile.read(length)) == length
+                self.control_body = self.rfile.read(length)
+                complete = len(self.control_body) == length
             except OSError:
                 complete = False
             finally:
@@ -3895,6 +4074,108 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+def model_aliases(aliases, name: str) -> list[str]:
+    if aliases is None:
+        aliases = []
+    if isinstance(aliases, str):
+        aliases = aliases.split(",")
+    if not isinstance(aliases, list) or not all(isinstance(x, str) for x in aliases):
+        raise ValueError(f"aliases={aliases!r}: expected a list of model names")
+    return list(dict.fromkeys(x.strip() for x in aliases if x.strip() and x.strip() != name))
+
+
+def model_settings(spec: dict) -> dict:
+    """Validate and collect the per-model settings before an engine can be installed."""
+    if spec.get("sampling") is not None and not isinstance(spec["sampling"], dict):
+        raise ValueError("sampling must be an object of generation defaults")
+    try:
+        sampling = sampling_defaults_from_config(spec)
+    except SystemExit as e:
+        raise ValueError(str(e)) from e
+    mode = spec.get("anthropic_thinking") or "model"
+    if mode not in ("model", "on_request"):
+        raise ValueError(f'anthropic_thinking must be "model" or "on_request", not {mode!r}')
+    repeat = spec.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)
+    if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 0:
+        raise ValueError(f'"repeat_stop_tokens" must be a whole number >= 0 (0 = off), not {repeat!r}')
+    budget = spec.get("reasoning_budget_tokens")
+    if budget is None:
+        budget = 0
+    if isinstance(budget, float) and budget.is_integer():
+        budget = int(budget)
+    if isinstance(budget, bool) or not isinstance(budget, int):
+        raise ValueError(f"reasoning_budget_tokens={budget!r}: expected a whole number of tokens (0: no budget)")
+    gpus = gpu_list(spec)
+    return {"sampling_defaults": sampling, "aliases": model_aliases(spec.get("aliases"), spec["model_name"]),
+            "reasoning_budget_tokens": budget, "repeat_stop_tokens": repeat,
+            "anthropic_think_unasked": mode == "model", "fit_max_tokens": spec.get("fit_max_tokens") is True,
+            "gpu_index": (gpus or [0])[0], "gpu_indices": gpus, "backend": spec.get("backend")}
+
+
+MODEL_GLOBAL_KEYS = frozenset(("host", "port", "api_key", "cors_origins", "trusted_origins", "allowed_hosts",
+                               "mcp_servers", "before_load", "api_monitor", "idle_unload_s", "min_free_vram_mib",
+                               "open_browser", "lazy_load"))
+
+
+def validate_model_specs(cfg: dict, engine: str = "strata", tokenizer: str | None = None) -> dict[str, dict]:
+    """Snapshot complete per-model configs, including the default, before any engine is started.
+
+    Entries inherit only cwd. Relative paths use that cwd, rather than the config file's directory. Network,
+    security and lifecycle controls belong to the server and cannot be overridden by an entry.
+    """
+    entries = cfg.get("models", [])
+    if not isinstance(entries, list):
+        raise ValueError('"models" must be a list of model configs')
+    default = {k: v for k, v in cfg.items() if k not in MODEL_GLOBAL_KEYS and k != "models"}
+    default.setdefault("model_name", "qwen3.8-flash-next")
+    default["tokenizer"] = default.get("tokenizer") or tokenizer or str(ROOT / "pack/full/tokenizer")
+    specs = {}
+    for index, entry in enumerate([default, *entries]):
+        if not isinstance(entry, dict):
+            raise ValueError(f"models[{index - 1}] must be a model config object")
+        name = entry.get("model_name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"models[{index - 1}] needs a non-empty model_name")
+        if name in specs:
+            raise ValueError(f"duplicate model_name {name!r}")
+        if index and MODEL_GLOBAL_KEYS.intersection(entry):
+            raise ValueError(f"model {name!r}: these keys stay global: "
+                             + ", ".join(sorted(MODEL_GLOBAL_KEYS.intersection(entry))))
+        spec = dict(entry)
+        spec["_engine"] = engine
+        cwd = spec.get("cwd") or cfg.get("cwd") or "."
+        if not isinstance(cwd, str):
+            raise ValueError(f"model {name!r}: cwd must be a path")
+        spec["cwd"] = os.path.abspath(cwd)
+        for key in ("exe", "tokenizer", "log", "expert_profile_save"):
+            path = spec.get(key)
+            if path is not None:
+                if not isinstance(path, str) or not path:
+                    raise ValueError(f"model {name!r}: {key} must be a non-empty path")
+                spec[key] = os.path.abspath(os.path.join(spec["cwd"], path))
+        spec.setdefault("tokenizer", str(ROOT / "pack/full/tokenizer"))
+        if spec.get("lib_dirs"):
+            if not isinstance(spec["lib_dirs"], list) or not all(isinstance(p, str) for p in spec["lib_dirs"]):
+                raise ValueError(f"model {name!r}: lib_dirs must be a list of paths")
+            spec["lib_dirs"] = [os.path.abspath(os.path.join(spec["cwd"], p)) for p in spec["lib_dirs"]]
+        if engine == "strata":
+            if not spec.get("exe"):
+                raise ValueError(f"model {name!r}: exe is required")
+            if not isinstance(spec.get("args"), list) or not all(isinstance(a, str) for a in spec["args"]):
+                raise ValueError(f"model {name!r}: args must be a list of engine arguments")
+            if not (Path(spec["tokenizer"]) / "vocab.json").exists():
+                raise ValueError(f"the model's tokenizer is missing ({Path(spec['tokenizer']) / 'vocab.json'}); "
+                                 "run setup again")
+        model_settings(spec)
+        specs[name] = spec
+    # A configured id must never appear as an alias for a different resident model.
+    for name, spec in specs.items():
+        collisions = set(model_aliases(spec.get("aliases"), name)).intersection(specs)
+        if collisions:
+            raise ValueError(f"model {name!r}: aliases collide with model_name: {', '.join(sorted(collisions))}")
+    return specs
+
+
 def load_tokenizer(tpath: Path):
     """The model's tokenizer from its directory (the pack's vocab.json + merges.txt + token_type.json), or None
     when the directory has none - the caller decides what that means (strata needs one, the mock falls back to
@@ -4003,6 +4284,19 @@ def main() -> int:
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
+    if a.engine == "strata" and not cfg:
+        ap.error("--engine strata needs --config")
+    try:
+        model_specs = validate_model_specs(cfg, a.engine, a.tokenizer)
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    default_spec = next(iter(model_specs.values()))
+    if a.script:
+        default_spec["script"] = list(a.script)
+    if a.fit_max_tokens:
+        default_spec["fit_max_tokens"] = True
+    cfg = {**cfg, **default_spec}
+    a.tokenizer = default_spec["tokenizer"]
     tpath = Path(a.tokenizer)
     tok = load_tokenizer(tpath)
     if tok is None:
@@ -4036,12 +4330,13 @@ def main() -> int:
             print(note, flush=True)
     else:
         effort_end = None
-        engine, vision, sampling_defaults = MockEngine(tok, a.script or [
-            "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+        engine, vision, sampling_defaults = MockEngine(tok, cfg.get("script") or [
+            "Thinking about it.</think>\n\nHello from the mock engine."]), None, sampling_defaults_from_config(cfg)
     svc = Service(engine, tok, chat_template_for(tpath),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    svc.model_specs, svc.current_spec = model_specs, default_spec
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
@@ -4155,14 +4450,15 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
+        closers = [httpd.shutdown, svc._close_failed_start, getattr(svc.engine, "close", None),
+                   svc.vision.close if svc.vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:
                 close()
             except KeyboardInterrupt:                   # a second Ctrl+C: don't wait for the engine to free its memory
-                if getattr(engine, "proc", None):
-                    engine.proc.kill()
+                if getattr(svc.engine, "proc", None):
+                    svc.engine.proc.kill()
         print("[strata] stopped", flush=True)
     return 0
 

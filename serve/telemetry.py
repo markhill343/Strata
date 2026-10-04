@@ -309,6 +309,18 @@ class Telemetry:
         dt = t - prev[0]
         return (c.read_bytes - prev[1]) / dt / 2**20, (c.write_bytes - prev[2]) / dt / 2**20
 
+    def set_gpus(self, gpu_index=0, gpu_indices=None, amd=False):
+        """Follow a model switched to another card or backend, keeping the existing sampler thread."""
+        idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
+        gpus = [(i, gpu_reader(i, amd)) for i in idx]
+        gpus = [(i, g) for i, g in gpus if g.ok()] or gpus[:1]
+        with self.lock:
+            self.gpus, self.gpu = gpus, gpus[0][1]
+            self.static.update(gpu_name=" + ".join(g.name() or "?" for _, g in gpus) if self.gpu.ok() else None,
+                               gpu_count=len(gpus))
+            self.now.clear()
+            self.hist.clear()
+
     def sample(self):
         s = {}
         if self.gpu.ok():
@@ -348,8 +360,8 @@ class Telemetry:
 
     def _loop(self):
         while True:
-            s = self.sample()
             with self.lock:
+                s = self.sample()
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):

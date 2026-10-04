@@ -6,6 +6,9 @@ trusted_origins, allowed_hosts), the MCP servers and before_load (which run prog
 here - is kept as it is: a change touches only the keys it names (as setup run again keeps the user's keys, #629).
 The earlier file is kept as strata-<model>.json.bak.  The server reads the config when it starts, so a change is
 used from the next start on.
+
+The optional `models` list of complete model configs is edited by hand, not in Settings in v1: this view edits
+flat keys only. Model switching reads the list at server startup.
 """
 from __future__ import annotations
 

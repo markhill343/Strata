@@ -144,6 +144,9 @@ Or `START-HERE.bat` / `./setup.sh` without flags, which starts the installed mod
 installed; add `--yes` to take the first). The server opens the user's browser on `http://127.0.0.1:8080` when it is
 ready. Closing its window (or stopping the process) stops the model.
 
+With enough disk space for a second pack and RAM/VRAM to run either model, add its config to `"models"` and use
+`POST /v1/models/switch` without restarting the server; only one model is resident ([DETAILS.md](DETAILS.md#using-it)).
+
 ## 7. Verify
 
 The HTTP server answers once the model is loaded (30-90 s on later starts, a few minutes the first time). Poll:

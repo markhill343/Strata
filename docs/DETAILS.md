@@ -476,12 +476,64 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
+| Switch the resident model | `POST /v1/models/switch`, `POST /switch` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (single slot, busy or idle) |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
-`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
+`/models` and `/v1/models` list the resident model and its aliases, with its context limit and input modalities,
+plus configured alternatives marked `"status": {"value": "switchable"}` and `"switchable": true`. `/props` exposes
+the original chat template, context limit, configured generation defaults (shared settings take precedence), model
+path and engine version when available. Context means the full engine context, not the resident KV window.
+`n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. On `/props`, `autoload` has no
+effect and an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is
+configured. They do not load, unload or restart models.
+
+**Switching models.** The top-level keys in `strata-<model>.json` still describe the default model. Add a `"models"`
+list by hand for other installed models, with a complete config for each: its own `model_name`, `exe`, `args`,
+`tokenizer`, and any `vision`, `sampling`, `aliases`, GPU or reasoning settings it needs. Names must be unique and
+cannot collide with another model's aliases. A relative path uses the entry's `cwd`, or the default config's `cwd`
+when absent. For example:
+
+```json
+"models": [
+  {
+    "model_name": "local-coder",
+    "cwd": "/path/to/Strata",
+    "exe": "engine/strata",
+    "args": ["--native", "/path/to/coder/full", "--max-context", "32768"],
+    "tokenizer": "/path/to/coder/tokenizer",
+    "log": "strata-coder.log"
+  }
+]
+```
+
+Network/security settings (`host`, `port`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts`),
+`mcp_servers`, `before_load`, `api_monitor`, `idle_unload_s`, `min_free_vram_mib`, `open_browser` and `lazy_load`
+stay global; do not put them in a model entry. Settings does not edit this list in v1. Invalid entries, duplicate
+names and missing native tokenizers stop the server before an engine starts.
+
+```sh
+curl -H 'Content-Type: application/json' -d '{"model":"local-coder"}' \
+  http://127.0.0.1:8080/v1/models/switch
+```
+
+Send the configured API key too when required. `/switch` accepts the same JSON body. Both require JSON from
+Strata's own page or a direct API client; a foreign browser origin is refused even with an API key. Only one model
+is resident: a switch unloads the engine and vision encoder, then starts the requested model. The request waits
+until it is ready and can take minutes, so allow a long client timeout. Requests arriving during the switch wait
+for it. Success returns `"status": "switched"` and the model's status; the resident name returns `"status": "already"`
+without reloading it. An unknown name returns **404** `model not found` with a `known` list; a running or queued
+request or another model control returns **409** `model_busy`.
+
+The `min_free_vram_mib` check runs after unloading, on the replacement's first GPU. A refused check or a failed
+start returns **503** and starts the previous model again. If restoring it also fails, the error says so and the
+next inference request retries it. The replacement is installed only after it starts. Model sampling defaults,
+aliases and conversation cache state change with it; shared Chat settings and server totals stay. The default
+model remains switchable, including with `lazy_load`. `/v1/status` exposes the configured names in
+`switchable_models`. Chat requests never switch models automatically: another `model` name still uses the
+resident weights, as before.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{

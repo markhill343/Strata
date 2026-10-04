@@ -3927,20 +3927,26 @@ def build_vision(cfg: dict, env: dict) -> Vision:
                   env=vision_env(cfg, env))
 
 
-def build_engine(cfg: dict, tok, env: dict, lazy: bool) -> tuple["StrataEngine", bool]:
-    """The engine for one model config, exactly as a start builds it: the checks that must fail before the
-    minutes-long start (the layer split #644, the silence limit #481, effort_position #458), the absolute "exe"
-    (Windows' CreateProcess resolves a relative one against nothing, WinError 2), and the StrataEngine itself.
-    -> (engine, whether effort_position=end is in use).  A config error raises ValueError: the caller says it as
-    a start stops (main) or as a model switch refuses (Service)."""
+def engine_start_checks(cfg: dict, tok) -> tuple[str, float, list[str] | None]:
+    """What a model start must check before the minutes-long engine start: the layer split (#644), the silence
+    limit (#481), effort_position (#458), and the absolute "exe" (Windows' CreateProcess resolves a relative one
+    against nothing, WinError 2).  -> (exe, silence_s, the effort_position args or None).  A config error raises
+    ValueError: the caller says it as a start stops (main) or as a model switch refuses (Service)."""
     if len(gpu_list(cfg)) > 1:
         split = layer_split_value(cfg)          # #644: before the (minutes-long) start
         print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+    silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
     # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
     # it is told about (WinError 2), so it is made absolute here
     exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
-    silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
-    effort_end = effort_end_args(cfg, exe, tok)  # #458
+    return exe, silence, effort_end_args(cfg, exe, tok)   # #458
+
+
+def build_engine(cfg: dict, env: dict, lazy: bool, checked: tuple) -> tuple["StrataEngine", bool]:
+    """The engine process for a config its engine_start_checks passed: the same arguments a start passes
+    (engine_args plus the effort_position args).  The engine's own errors - a bad engine option, an exit before
+    READY - escape as they did before this extraction; only the config checks raise ValueError."""
+    exe, silence, effort_end = checked
     engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                           env=env, lazy=lazy)
     engine.silence_s = silence                  # an attribute of its own: restart() keeps it
@@ -4019,9 +4025,10 @@ def main() -> int:
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         try:
-            engine, effort_end = build_engine(cfg, tok, env, lazy)
+            checked = engine_start_checks(cfg, tok)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
+        engine, effort_end = build_engine(cfg, env, lazy, checked)
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop())

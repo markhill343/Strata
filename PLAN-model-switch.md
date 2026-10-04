@@ -56,10 +56,12 @@ Validation at start (`main()`), before any minutes-long engine start:
   `ByteTokenizer`). `main()` calls it; the switch path calls it per model.
 - `chat_template_for(tpath: Path) -> ChatTemplate` — `tpath/chat_template.jinja` if it
   exists, else `ROOT/serve/chat_template.jinja` (the rule at 4013–4015).
-- `build_engine(cfg_entry, tok) -> StrataEngine` — the per-model part of 3962–4004:
-  `gpu_list`/`layer_split_value` pre-check, `engine_silence_s`, `effort_end_args`,
-  `engine_args(cfg)`, absolute-exe fix, `StrataEngine(..., lazy=True)` — always lazy for
-  a switch target (the engine is started right after, see 3.).
+- `engine_start_checks(cfg, tok) -> (exe, silence_s, effort_end_args)` +
+  `build_engine(cfg, env, lazy, checked) -> StrataEngine` — the per-model part of
+  3962–4004, split so the ValueError→SystemExit boundary stays exactly where it was:
+  only the config checks (layer split, silence, effort_position) raise ValueError; the
+  engine's own errors (bad engine option, exit before READY) escape as before. For a
+  switch target, always `lazy=True` (the engine is spawned right after, see 3.).
 - `build_vision(cfg_entry, env)` — the vision-config path resolution + `Vision(...)`
   from 3974–3981.
 
@@ -67,9 +69,11 @@ Keep `main()` calling these so there is exactly one tokenizer/template/engine co
 
 ## 3. Service changes
 
-`Service.__init__` gains `self.model_specs: dict[str, dict] = {}` (name → config entry,
-default model NOT included) and `self.default_spec` is not needed — the running state
-(`engine/tok/template/model/vision/sampling_defaults/aliases/stop_ids/...`) stays as-is.
+`Service.__init__` gains `self.model_specs: dict[str, dict] = {}` — name → config entry,
+**including the default model's own spec** (review finding: after switching away, the
+default must stay switchable back to, and its spec is what the rollback path rebuilds).
+The running state (`engine/tok/template/model/vision/sampling_defaults/aliases/stop_ids/...`)
+stays as-is.
 
 New method `switch_model(name: str) -> dict` on `Service`:
 
@@ -80,31 +84,35 @@ New method `switch_model(name: str) -> dict` on `Service`:
    `busy or queued` → `ModelBusy` — parallel requests do not hold the fifo, so this
    check is required (copy 3129–3134).
 4. Inside the fifo:
-   a. **min_free_vram check FIRST, before anything is unloaded** (decided): when
-      `self.min_free_vram_mib` is set, call `self.free_vram_mib()` with the same
-      wait-until-deadline loop `ensure_loaded` uses (1785–1793); if the new model's
-      requirement is not covered, raise `GpuBusy` (503) and change nothing — the current
-      model keeps running. (The engine's own start would fail with an OOM anyway;
-      checking first avoids destroying a working model for a load that cannot fit.)
-   b. `self.engine.close()` (ends the process; `EngineStuck` → 503, server unchanged),
+   a. `self.engine.close()` (ends the process; `EngineStuck` → 503, server unchanged),
       and `self.vision.close()` if present. Do NOT reuse `restart()` — the spawn tuple
       must change.
+   b. **min_free_vram check AFTER the unload, before the new engine spawns** (decided
+      after review): the old model's VRAM is what the replacement needs, so checking
+      before the unload would count the current model's allocation against its own
+      replacement (a switch that fits would be refused). Use the same
+      wait-until-deadline loop `ensure_loaded` uses (1785–1793); on GpuBusy (503),
+      restart the OLD engine (the rollback path below) — the current model comes back.
    c. Build the new pieces from the spec: `tok = load_tokenizer(...)`,
-      `template = chat_template_for(...)`, `engine = build_engine(spec, lazy=True)`,
+      `template = chat_template_for(...)`, `checked = engine_start_checks(spec, tok)`
+      (ValueError → 400/503, nothing else touched),
       `vision = build_vision(spec)` if configured (vision starts before the engine so a
-      GPU encoder takes its VRAM first — same order as `ensure_loaded`).
+      GPU encoder takes its VRAM first — same order as `ensure_loaded`), then
+      `engine = build_engine(spec, env, lazy=True, checked)` and spawn it
+      (`engine.restart()` — `StrataEngine(lazy=True)` does not spawn; lazy first lets a
+      failed tokenizer load fail before any process spawns).
    d. On any failure (engine exits before READY, vision fails): the old model is already
       gone — rebuild the OLD engine from its old spec and report the failure (503 with
       the engine's start hint). Keep the old spec around for exactly this rollback.
-   e. Swap on self: `engine, tok, template, model, vision`, plus per-model
-      `sampling_defaults`, `aliases` (from the entry; empty if absent), `stop_ids`
-      (recomputed from the new tokenizer, 1709–1710), `effort_end`, `gpu_index`/
-      `gpu_indices`/`backend` (monitor reads the right card), `reasoning_budget_tokens`
-      if the entry sets one. Re-apply `self.vram_reserve` via `engine.vram(...)` like
-      `ensure_loaded` does (1807–1811).
-   f. Spawn the lazy engine (`engine.restart()` — `StrataEngine(lazy=True)` does not
-      spawn; lazy first lets a failed tokenizer load fail before any process spawns).
-   g. Reset per-model runtime state that must not leak: `self.rate.clear()`,
+   e. Only after the new engine is running and READY: swap on self — `engine, tok,
+      template, model, vision`, plus per-model `sampling_defaults`, `aliases` (from the
+      entry; empty if absent), `stop_ids` (recomputed from the new tokenizer,
+      1709–1710), `effort_end`, `gpu_index`/`gpu_indices`/`backend` (monitor reads the
+      right card), `reasoning_budget_tokens` if the entry sets one. Re-apply
+      `self.vram_reserve` via `engine.vram(...)` like `ensure_loaded` does (1807–1811)
+      — AFTER the engine runs, else `vram()` raises EngineDied. Publishing a started
+      engine also keeps readers outside the fifo from seeing a half-installed model.
+   f. Reset per-model runtime state that must not leak: `self.rate.clear()`,
       `self.live_reqs.clear()`, `self.last_timings = None`, `self.conv_log.reset()`,
       `self.totals` keep (they are server-wide). `shared` settings stay (they are
       client settings, not model settings).
@@ -201,9 +209,10 @@ serve.test_lifecycle -v` — all green, plus the existing suite untouched.
 - Long synchronous request: a switch holds the HTTP connection for minutes. Matches
   `/load`; clients with short timeouts may hang — document it. (Job/poll API is the
   fallback if that turns out to matter.)
-- VRAM: switching does not check `min_free_vram_mib` before loading the new model —
-  decide: reuse `ensure_loaded`'s check (recommended: yes, same GpuBusy 503) before
-  unloading the old one, so a refused switch leaves the current model running.
+- VRAM: the min_free_vram check runs AFTER the unload and before the new engine spawns
+  (the old model's VRAM is what the replacement needs — checking earlier would count it
+  against itself); on GpuBusy the old engine is restarted, so the current model comes
+  back. See §3.4b.
 - MCP hub, api_monitor, history/metrics: server-wide, untouched.
 - `lazy_load` + `"models"`: allowed; the default stays unloaded, switching still works.
 - Upstream: this is a fork feature; keep it additive so a future upstream merge stays

@@ -3895,6 +3895,58 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+def load_tokenizer(tpath: Path):
+    """The model's tokenizer from its directory (the pack's vocab.json + merges.txt + token_type.json), or None
+    when the directory has none - the caller decides what that means (strata needs one, the mock falls back to
+    ByteTokenizer).  Extracted from main() so a model switch builds another model's tokenizer the same way."""
+    if not (tpath / "vocab.json").exists():
+        return None
+    import strata_tokenizer as ST
+    vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+    tokens = [None] * len(vocab)
+    for t, i in vocab.items():
+        tokens[i] = t
+    merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
+    types = json.loads((tpath / "token_type.json").read_text())
+    return ST.Tokenizer(tokens, merges, types)
+
+
+def chat_template_for(tpath: Path) -> ChatTemplate:
+    """The model's own chat template (exported with its tokenizer), else the original model's."""
+    tpl = tpath / "chat_template.jinja"
+    return ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja")
+
+
+def build_vision(cfg: dict, env: dict) -> Vision:
+    """The config's vision encoder, as a start builds it: its paths are the config's cwd's, as for the engine."""
+    print("loading the vision encoder ...", flush=True)
+    vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+            for k, v in cfg["vision"].items()}
+    return Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                  env=vision_env(cfg, env))
+
+
+def build_engine(cfg: dict, tok, env: dict, lazy: bool) -> tuple["StrataEngine", bool]:
+    """The engine for one model config, exactly as a start builds it: the checks that must fail before the
+    minutes-long start (the layer split #644, the silence limit #481, effort_position #458), the absolute "exe"
+    (Windows' CreateProcess resolves a relative one against nothing, WinError 2), and the StrataEngine itself.
+    -> (engine, whether effort_position=end is in use).  A config error raises ValueError: the caller says it as
+    a start stops (main) or as a model switch refuses (Service)."""
+    if len(gpu_list(cfg)) > 1:
+        split = layer_split_value(cfg)          # #644: before the (minutes-long) start
+        print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+    # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
+    # it is told about (WinError 2), so it is made absolute here
+    exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
+    silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
+    effort_end = effort_end_args(cfg, exe, tok)  # #458
+    engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                          env=env, lazy=lazy)
+    engine.silence_s = silence                  # an attribute of its own: restart() keeps it
+    return engine, bool(effort_end)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -3945,24 +3997,16 @@ def main() -> int:
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
-    tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
-    if (tpath / "vocab.json").exists():
-        import strata_tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
-        tokens = [None] * len(vocab)
-        for t, i in vocab.items():
-            tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+    tok = load_tokenizer(tpath)
+    if tok is None:
+        if a.engine == "strata":
+            ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
+        tok = ByteTokenizer()
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
-        vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
@@ -3971,36 +4015,13 @@ def main() -> int:
         lazy = a.lazy or cfg.get("lazy_load") is True
         if lazy and cfg.get("vision"):
             ap.error("lazy loading is text-only; disable vision in the config")
-        if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
-            # relative paths are the config's cwd's, as for the engine below
-            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                    for k, v in cfg["vision"].items()}
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env))
+        vision = build_vision(cfg, env) if cfg.get("vision") else None
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
-        if len(gpu_list(cfg)) > 1:
-            try:
-                split = layer_split_value(cfg)          # #644: before the (minutes-long) start
-            except ValueError as e:
-                raise SystemExit(f"[strata] config {e}")
-            print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
-        # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
-        # it is told about (WinError 2), so it is made absolute here
-        exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
-            silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
+            engine, effort_end = build_engine(cfg, tok, env, lazy)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
-        except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
-        engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop())
@@ -4010,9 +4031,7 @@ def main() -> int:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    svc = Service(engine, tok, chat_template_for(tpath),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)

@@ -2347,7 +2347,7 @@ class Service:
                         raise
             finally:
                 if vision is not None:
-                    vision.close()
+                    vision.shutdown()                # this object is discarded, not restarted: its cache dir goes
             raise
 
     @contextlib.contextmanager
@@ -2392,9 +2392,11 @@ class Service:
             self._close_failed_start()
             if hasattr(self.engine, "close"):
                 self.engine.close()                  # EngineStuck: retain ownership, never spawn a replacement
+            self._run_before_load()                 # the hook may free GPU/RAM the replacement needs (#1012 rule)
             try:
                 if self.vision is not None:
-                    self.vision.close()
+                    self.vision.shutdown()           # the old encoder object is replaced, not restarted: its
+                    # cache directory would otherwise be orphaned across switches (#914)
                 self._wait_free_vram(self.model_specs[name])  # after unload, on the replacement's first GPU
                 replacement = self._start_model(self.model_specs[name])
             except Exception as error:
@@ -2492,19 +2494,25 @@ class Service:
             self._failed_start_engine.close()
             self._failed_start_engine = None
 
+    def _run_before_load(self):
+        """The global before_load hook: it can free GPU/RAM another program holds, so it runs before any start
+        that needs the memory - ensure_loaded and a model switch alike."""
+        if not self.before_load:
+            return
+        cmd = self.before_load
+        print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+        try:
+            subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"[strata] the before_load command failed ({e}); loading anyway", flush=True)
+
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
         self._close_failed_start()
         if self.loaded() and not self._vision_down():
             return
-        if self.before_load:
-            cmd = self.before_load
-            print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
-            try:
-                subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
-            except (OSError, subprocess.SubprocessError) as e:
-                print(f"[strata] the before_load command failed ({e}); loading anyway", flush=True)
+        self._run_before_load()
         self._wait_free_vram()
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder again ...", flush=True)   # the engine sizes its cache
@@ -4956,8 +4964,14 @@ def model_settings(spec: dict) -> dict:
     if isinstance(budget, bool) or not isinstance(budget, int):
         raise ValueError(f"reasoning_budget_tokens={budget!r}: expected a whole number of tokens (0: no budget)")
     gpus = gpu_list(spec)
+    recovery = spec.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
+    if recovery is True:
+        recovery = "recover"
+    if recovery is not False and recovery not in ("stop", "recover"):
+        raise ValueError(f'"reasoning_loop_recovery" must be false, "stop" or "recover", not {recovery!r}')
     return {"sampling_defaults": sampling, "aliases": model_aliases(spec.get("aliases"), spec["model_name"]),
             "reasoning_budget_tokens": budget, "repeat_stop_tokens": repeat,
+            "reasoning_loop_recovery": recovery,
             "anthropic_think_unasked": mode == "model", "fit_max_tokens": spec.get("fit_max_tokens") is True,
             "gpu_index": (gpus or [0])[0], "gpu_indices": gpus, "backend": spec.get("backend")}
 
@@ -4999,18 +5013,24 @@ def validate_model_specs(cfg: dict, engine: str = "strata", tokenizer: str | Non
         spec["cwd"] = os.path.abspath(cwd)
         if index and engine == "strata" and not spec.get("tokenizer"):
             raise ValueError(f"model {name!r}: tokenizer is required")
+        # the default keeps main's semantics exactly: only "exe" is the cwd's (Windows' CreateProcess), the other
+        # paths stay as the server resolves them today (its working directory).  An added entry resolves its
+        # relative paths against its own cwd, else the config's - the rule a switch must use to find its files.
         for key in ("exe", "tokenizer", "log", "expert_profile_save"):
             path = spec.get(key)
-            if path is not None:
-                if not isinstance(path, str) or not path:
-                    raise ValueError(f"model {name!r}: {key} must be a non-empty path")
+            if path is None:
+                continue
+            if not isinstance(path, str) or not path:
+                raise ValueError(f"model {name!r}: {key} must be a non-empty path")
+            if index or key == "exe":
                 spec[key] = os.path.abspath(os.path.join(spec["cwd"], path))
         if engine == "mock":
             spec["tokenizer"] = spec.get("tokenizer") or str(ROOT / "pack/full/tokenizer")
         if spec.get("lib_dirs"):
             if not isinstance(spec["lib_dirs"], list) or not all(isinstance(p, str) for p in spec["lib_dirs"]):
                 raise ValueError(f"model {name!r}: lib_dirs must be a list of paths")
-            spec["lib_dirs"] = [os.path.abspath(os.path.join(spec["cwd"], p)) for p in spec["lib_dirs"]]
+            if index:
+                spec["lib_dirs"] = [os.path.abspath(os.path.join(spec["cwd"], p)) for p in spec["lib_dirs"]]
         if engine == "strata":
             if not spec.get("exe"):
                 raise ValueError(f"model {name!r}: exe is required")

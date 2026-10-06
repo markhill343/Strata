@@ -89,7 +89,11 @@ class ConfigValidation(unittest.TestCase):
             specs = self.specs([{"model_name": "second", "exe": "engine", "tokenizer": "tok", "log": "log"},
                                 {"model_name": "third", "cwd": tmp + "/other", "exe": "engine"}],
                                cwd=tmp, tokenizer="default-tok")
-            self.assertEqual(specs["default"]["tokenizer"], str(Path(tmp) / "default-tok"))
+            # the default keeps main's semantics: only its exe is the cwd's, its other paths stay as the
+            # server resolves them today (relative to the working directory, unchanged)
+            self.assertEqual(specs["default"]["tokenizer"], "default-tok")
+            self.assertEqual(self.specs([], cwd=tmp, tokenizer="default-tok", exe="engine")
+                             ["default"]["exe"], str(Path(tmp) / "engine"))
             self.assertEqual(specs["second"]["exe"], str(Path(tmp) / "engine"))
             self.assertEqual(specs["second"]["tokenizer"], str(Path(tmp) / "tok"))
             self.assertEqual(specs["second"]["log"], str(Path(tmp) / "log"))
@@ -110,7 +114,8 @@ class ConfigValidation(unittest.TestCase):
 
     def test_per_model_settings_are_validated_at_start(self):
         for settings in ({"sampling": {"top_p": 2}}, {"sampling": []}, {"aliases": [1]}, {"reasoning_budget_tokens": True},
-                         {"repeat_stop_tokens": -1}, {"anthropic_thinking": "invalid"}):
+                         {"repeat_stop_tokens": -1}, {"anthropic_thinking": "invalid"},
+                         {"reasoning_loop_recovery": "invalid"}):
             with self.subTest(settings=settings), self.assertRaises(ValueError):
                 self.specs([{"model_name": "second", **settings}])
 
@@ -544,7 +549,7 @@ class ModelSwitching(unittest.TestCase):
         server.build_engine.side_effect = build
         with mock.patch.object(server, "build_vision", side_effect=start_vision):
             self.assertEqual(self.switch()[0], 503)
-        vision.close.assert_called_once()
+        vision.shutdown.assert_called_once()      # a discarded encoder object cleans its cache dir (#914)
         self.assertEqual(self.chat(), "Default answer.")
 
     def test_vision_failure_rolls_back_without_building_target_engine(self):
@@ -564,9 +569,28 @@ class ModelSwitching(unittest.TestCase):
         self.svc.vision = old_vision
         with mock.patch.object(server, "build_vision", return_value=new_vision):
             self.assertEqual(self.switch()[0], 200)
-        old_vision.close.assert_called_once()
+        old_vision.shutdown.assert_called_once()  # replaced, not restarted: its cache dir must go (#914)
+        old_vision.close.assert_not_called()
         new_vision.close.assert_not_called()
         self.assertIs(self.svc.vision, new_vision)
+
+    def test_switch_runs_the_before_load_hook(self):
+        # the hook frees GPU/RAM another program holds: a switch starts a new engine, so it runs like ensure_loaded's
+        marker = Path(self.tmp.name, "hooked")
+        self.svc.before_load = f"touch {marker}"
+        self.assertEqual(self.switch()[0], 200)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        self.switch("default")
+        self.assertTrue(marker.exists())
+
+    def test_reasoning_loop_recovery_follows_the_model(self):
+        self.svc.reasoning_loop_recovery = "recover"
+        self.specs["second"]["reasoning_loop_recovery"] = "stop"
+        self.assertEqual(self.switch()[0], 200)
+        self.assertEqual(self.svc.reasoning_loop_recovery, "stop")
+        self.switch("third")                          # an entry without the key gets the default again
+        self.assertIs(self.svc.reasoning_loop_recovery, False)
 
     def test_failed_encoder_start_ends_its_process(self):
         proc = mock.Mock()

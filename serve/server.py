@@ -4997,13 +4997,16 @@ def validate_model_specs(cfg: dict, engine: str = "strata", tokenizer: str | Non
         if not isinstance(cwd, str):
             raise ValueError(f"model {name!r}: cwd must be a path")
         spec["cwd"] = os.path.abspath(cwd)
+        if index and engine == "strata" and not spec.get("tokenizer"):
+            raise ValueError(f"model {name!r}: tokenizer is required")
         for key in ("exe", "tokenizer", "log", "expert_profile_save"):
             path = spec.get(key)
             if path is not None:
                 if not isinstance(path, str) or not path:
                     raise ValueError(f"model {name!r}: {key} must be a non-empty path")
                 spec[key] = os.path.abspath(os.path.join(spec["cwd"], path))
-        spec.setdefault("tokenizer", str(ROOT / "pack/full/tokenizer"))
+        if engine == "mock":
+            spec["tokenizer"] = spec.get("tokenizer") or str(ROOT / "pack/full/tokenizer")
         if spec.get("lib_dirs"):
             if not isinstance(spec["lib_dirs"], list) or not all(isinstance(p, str) for p in spec["lib_dirs"]):
                 raise ValueError(f"model {name!r}: lib_dirs must be a list of paths")
@@ -5018,11 +5021,17 @@ def validate_model_specs(cfg: dict, engine: str = "strata", tokenizer: str | Non
                                  "run setup again")
         model_settings(spec)
         specs[name] = spec
-    # A configured id must never appear as an alias for a different resident model.
+    # An id or alias must resolve to only one configured model, whichever model is resident.
+    seen_aliases = {}
     for name, spec in specs.items():
-        collisions = set(model_aliases(spec.get("aliases"), name)).intersection(specs)
+        aliases = model_aliases(spec.get("aliases"), name)
+        collisions = set(aliases).intersection(specs)
         if collisions:
             raise ValueError(f"model {name!r}: aliases collide with model_name: {', '.join(sorted(collisions))}")
+        for alias in aliases:
+            if alias in seen_aliases:
+                raise ValueError(f"model {name!r}: alias {alias!r} also belongs to model {seen_aliases[alias]!r}")
+            seen_aliases[alias] = name
     return specs
 
 

@@ -73,6 +73,11 @@ class ConfigValidation(unittest.TestCase):
             self.specs([{"model_name": "alias"}], aliases="alias, other")
         with self.assertRaisesRegex(ValueError, "collide"):
             self.specs([{"model_name": "second", "aliases": ["default"]}])
+        with self.assertRaisesRegex(ValueError, "also belongs"):
+            self.specs([{"model_name": "second", "aliases": ["shared"]}], aliases=["shared"])
+        with self.assertRaisesRegex(ValueError, "also belongs"):
+            self.specs([{"model_name": "second", "aliases": ["shared"]},
+                        {"model_name": "third", "aliases": ["shared"]}])
 
     def test_global_settings_cannot_be_overridden(self):
         for key in server.MODEL_GLOBAL_KEYS:
@@ -98,6 +103,10 @@ class ConfigValidation(unittest.TestCase):
             self.assertIn("default", validate_model_specs(default))
             with self.assertRaisesRegex(ValueError, "tokenizer is missing.*vocab.json.*run setup again"):
                 validate_model_specs({**default, "models": [dict(default, model_name="second", tokenizer=tmp + "/absent")]})
+            for missing in ({}, {"tokenizer": None}, {"tokenizer": ""}):
+                with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "tokenizer is required"):
+                    validate_model_specs({**default, "models": [{"model_name": "second", "exe": "engine",
+                                                                   "args": [], **missing}]})
 
     def test_per_model_settings_are_validated_at_start(self):
         for settings in ({"sampling": {"top_p": 2}}, {"sampling": []}, {"aliases": [1]}, {"reasoning_budget_tokens": True},
